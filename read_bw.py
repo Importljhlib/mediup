@@ -13,12 +13,12 @@ import hashlib
 import math
 from pathlib import Path
 
-import numpy as np
+import numpy as np 
 import wfdb
 from scipy.signal import resample_poly
 from tqdm import tqdm
 
-SNR_LEVEL = [24, 18, 12, 6, 0, -6]
+SNR_LEVELS = [24, 18, 12, 6, 0, -6]
 TARGET_FS = 360
 WIN_SECONDS = 10
 WIN_SAMPLES = TARGET_FS * WIN_SECONDS
@@ -60,7 +60,13 @@ def mix_with_snr(clean: np.ndarray, noise: np.ndarray, snr_db: float, tol_db=TOL
     p_noise_src = np.mean(noise**2)
 
     alpha = np.sqrt(p_noise_target / (p_noise_src + 1e-12))
-    mixed = clean + alpha * noise[None, :]
+    if noise.ndim == 2 and noise.shape[0] == clean.shape[-1]:
+        # (3600, 2) → (2, 3600)로 전치
+        noise = noise.T
+    elif noise.ndim == 1:
+        noise = noise[None, :]
+
+    mixed = clean + alpha * noise
 
     resid = mixed - clean
     p_resid = np.mean(resid**2)
@@ -85,7 +91,7 @@ def main(root: Path, bw_dir: Path, out_root: Path):
     bw_rs = to_target_fs(bw_raw, fs_bw, TARGET_FS)
 
     meta_in = root / "segments.csv"
-    assert meta_in.exists(), f"fdsfdsf"
+    assert meta_in.exists(), f"Not found: {meta_in}"
     rows = []
     with open(meta_in, newline="", encoding='utf-8') as f:
         reader = csv.DictReader(f)
@@ -102,3 +108,64 @@ def main(root: Path, bw_dir: Path, out_root: Path):
     fout = open(meta_out_path, "w", newline="", encoding='utf-8')
     writer = csv.DictWriter(fout, fieldnames=fieldnames)
     writer.writeheader()
+
+    print("Mixing!")
+
+    for r in tqdm(rows, total=len(rows)):
+        split = r["split"]
+        in_path = (root.parent / r["path"]).resolve()
+        clean = np.load(in_path)  # (L,) 또는 (C, L)
+        # 채널/길이 확인 및 3600 고정
+        if clean.ndim == 1:
+            clean = clean[None, :]
+        if clean.shape[-1] != WIN_SAMPLES:
+            raise ValueError(f"Unexpected length {clean.shape[-1]} for {in_path.name}")
+
+        # (옵션) 채널이 2라면 그대로 둠 (Lead I, II)
+        C = clean.shape[0]
+
+        for snr in SNR_LEVELS:
+            # 재현 가능한 seed (파일명+snr 기반)
+            seed = deterministic_seed(r["id"], snr)
+            bw_slice = get_bw_slice(bw_rs, WIN_SAMPLES, seed)
+
+            mixed, alpha, snr_meas = mix_with_snr(clean, bw_slice, snr_db=float(snr), tol_db=TOL_DB)
+
+            # 저장 파일명: <id>_bw_<SNR>dB.npy
+            stem = Path(r["id"]).stem if r["id"].endswith(".npy") else r["id"]
+            out_name = f"{stem}_bw_{snr}dB.npy"
+            out_path = out_root / split / out_name
+            np.save(out_path, mixed.astype(np.float64))
+
+            # 메타 기록
+            writer.writerow({
+                "id": out_name.replace(".npy",""),
+                "record": r["record"],
+                "start_s": r["start_s"],
+                "duration_s": r["duration_s"],
+                "sampling_rate": TARGET_FS,
+                "noise": "bw",
+                "snr_db": snr,
+                "scale_alpha": alpha,
+                "seed": seed,
+                "split": split,
+                "path": str(out_path).replace("\\","/"),
+            })
+
+    fout.close()
+    print(f"[DONE] Saved mixed segments to: {out_root}")
+    print(f"[DONE] Metadata: {meta_out_path}")
+    print("[TIP] 샘플 몇 개를 열어 실제 SNR을 재검증해보세요.")
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", required=True, help="clean_segments 폴더 경로 (segments.csv 포함)")
+    ap.add_argument("--bw_dir", required=True, help="NSTDB BW 파일이 있는 경로 (bw.dat/bw.hea)")
+    ap.add_argument("--out", default=None, help="출력 폴더 (기본: clean_segments_bw)")
+    args = ap.parse_args()
+
+    root = Path(args.root)
+    bw_dir = Path(args.bw_dir)
+    out_root = Path(args.out) if args.out else (root.parent / "clean_segments_bw")
+
+    main(root, bw_dir, out_root)
